@@ -34,6 +34,22 @@
  * (a Content-Length that is not only digits, or given twice, and a
  * Transfer-Encoding that is more than "chunked").
  *
+ * Then the request body framings that a peer, or something in front of it,
+ * could have read two ways: duplicate Content-Length, a Content-Length list,
+ * Content-Length together with Transfer-Encoding, and a Transfer-Encoding
+ * that is a list of codings.  Each is refused whole in one read that also
+ * carries a body and a request behind it, so the same bytes are never two
+ * different trusted requests; and the unambiguous framings, Content-Length,
+ * chunked, and chunked with a trailer field, keep their byte-exact results
+ * with the request pipelined behind the body still served as itself.
+ *
+ * Then what an upgrade leaves over.  What comes in the same read as a valid
+ * upgrade's head is the new protocol's, a coalesced first frame, and never
+ * another http request; while an upgrade that is refused (a version lws does
+ * not speak, no key, a body of its own) hands nothing to the ws role, which
+ * must never be given bytes no 101 verified.  And a request head that never
+ * ends is not a request at its deadline, nor is what arrives afterwards.
+ *
  * Then a ws close the peer starts, in either role: a pong it is owed for a
  * ping sent before its close still goes, ahead of the answer to the close,
  * and a close that comes while a frame of ours is still partly unsent is
@@ -750,6 +766,28 @@ find_bytes(const uint8_t *hay, size_t hlen, const char *needle)
 	return NULL;
 }
 
+/*
+ * How many h1 responses there are in what the connection wrote: one status
+ * line each.  What a peer read as one request being answered twice, or as
+ * the next request on the connection, is a desync, so some cases count
+ * them.  The applications' bodies here never contain "HTTP/1.1 ", so any
+ * match is a status line.
+ */
+static size_t
+count_answers(const struct transport *tp)
+{
+	const uint8_t *b = tp->tx;
+	size_t n = 0;
+
+	while ((b = find_bytes(b, (size_t)(tp->tx + tp->tx_len - b),
+			       "HTTP/1.1 "))) {
+		n++;
+		b += 9;
+	}
+
+	return n;
+}
+
 /* the server half's protocols */
 
 static int
@@ -1140,6 +1178,9 @@ callback_uri(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 	return lws_callback_http_dummy(wsi, reason, user, in, len);
 }
 
+/* ws messages the echo protocol was given, whatever connection they came on */
+static int echo_msgs;
+
 static int
 callback_echo(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 	      void *in, size_t len)
@@ -1148,6 +1189,12 @@ callback_echo(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 
 	switch (reason) {
 	case LWS_CALLBACK_RECEIVE:
+		/*
+		 * Counted apart from the transcript: a ws protocol must not be
+		 * given anything at all unless an upgrade was completed, so
+		 * the cases about refused upgrades check this is untouched
+		 */
+		echo_msgs++;
 		tr_step("app_rx", in, len);
 		/* "Hold" stops its rx, and is not echoed: case 28 */
 		if (len == 4 && !memcmp(in, "Hold", 4)) {
@@ -2020,6 +2067,455 @@ h1_short_answer_half(struct lws_context *cx, struct lws_vhost *vh)
 		return 1;
 	lwsl_user("case 39: an h1 answer completed short of its "
 		  "Content-Length ends the connection: PASS\n");
+
+	return 0;
+}
+
+/*
+ * A server connection of our own on a fresh transport, adopted on vh: the
+ * bytes the peer sends go in through feed(), what lws answers comes out in
+ * tp.  The fd under it is only its place in the poll set; no byte goes
+ * through it.  Returns NULL if the connection could not be made.
+ */
+static struct lws *
+server_conn(struct lws_vhost *vh, struct transport *tp, const char *name)
+{
+	struct lws *wsi;
+	int sv[2];
+
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv)) {
+		lwsl_err("socketpair failed\n");
+		return NULL;
+	}
+	close(sv[1]);
+	if (tp_register(tp, sv[0]))
+		return NULL;
+	wsi = lws_adopt_socket_vhost(vh, sv[0]);
+	if (!wsi) {
+		lwsl_err("adopt failed\n");
+		return NULL;
+	}
+	lws_set_transport(wsi, &tops, tp);
+	if (name)
+		tr_begin(name, "server", 0);
+
+	return wsi;
+}
+
+/*
+ * 57: a request whose body framing its peer could have read differently is
+ * refused whole, and nothing after its head is served.  The same bytes must
+ * never be two different trusted requests, one to us and another to whatever
+ * composed or forwarded them:
+ *
+ *  - two Content-Length headers, the same value or not: a second instance is
+ *    a list, however the sender split it, and where the body ends is exactly
+ *    what the two ends would disagree about
+ *  - one Content-Length header whose value is a list ("5, 5")
+ *  - Content-Length together with Transfer-Encoding: RFC 9112 6.3 has the
+ *    Transfer-Encoding override, but a front end may have taken the
+ *    Content-Length and framed the other way, so the request is not served
+ *  - a Transfer-Encoding that is more than one "chunked", in one header or
+ *    in two: we do not decode its codings, so 501
+ *
+ * Each is followed in the same read by a body and a request, and there must
+ * be exactly one answer, the refusal: the body and the request behind it
+ * are not this connection's to serve.
+ */
+static int
+h1_smuggle_framing_half(struct lws_context *cx, struct lws_vhost *vh)
+{
+#define SMUGGLE_BODY_AND_REQ \
+	"abcde" \
+	"GET /y?b=2 HTTP/1.1\r\nHost: sansio-uri\r\n\r\n"
+	static const struct {
+		const char	*name;
+		const char	*req;
+		const char	*status;
+	} c[] = {
+		{ "h1-smuggle-cl-twice",
+		  "POST /x HTTP/1.1\r\nHost: sansio-uri\r\n"
+		  "Content-Length: 5\r\nContent-Length: 5\r\n\r\n"
+		  SMUGGLE_BODY_AND_REQ, "HTTP/1.1 400 " },
+		{ "h1-smuggle-cl-differ",
+		  "POST /x HTTP/1.1\r\nHost: sansio-uri\r\n"
+		  "Content-Length: 3\r\nContent-Length: 5\r\n\r\n"
+		  SMUGGLE_BODY_AND_REQ, "HTTP/1.1 400 " },
+		{ "h1-smuggle-cl-list",
+		  "POST /x HTTP/1.1\r\nHost: sansio-uri\r\n"
+		  "Content-Length: 5, 5\r\n\r\n"
+		  SMUGGLE_BODY_AND_REQ, "HTTP/1.1 400 " },
+		{ "h1-smuggle-cl-te",
+		  "POST /x HTTP/1.1\r\nHost: sansio-uri\r\n"
+		  "Content-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n"
+		  "0\r\n\r\n" SMUGGLE_BODY_AND_REQ, "HTTP/1.1 400 " },
+		{ "h1-smuggle-te-list-one",
+		  "POST /x HTTP/1.1\r\nHost: sansio-uri\r\n"
+		  "Transfer-Encoding: chunked, gzip\r\n\r\n"
+		  "5\r\nabcde\r\n0\r\n\r\n" SMUGGLE_BODY_AND_REQ,
+		  "HTTP/1.1 501 " },
+		{ "h1-smuggle-te-list-two",
+		  "POST /x HTTP/1.1\r\nHost: sansio-uri\r\n"
+		  "Transfer-Encoding: chunked\r\n"
+		  "Transfer-Encoding: gzip\r\n\r\n"
+		  "5\r\nabcde\r\n0\r\n\r\n" SMUGGLE_BODY_AND_REQ,
+		  "HTTP/1.1 501 " },
+	};
+#undef SMUGGLE_BODY_AND_REQ
+	static struct transport tp;
+	size_t n;
+
+	for (n = 0; n < LWS_ARRAY_SIZE(c); n++) {
+		if (!server_conn(vh, &tp, c[n].name)) {
+			lwsl_err("case 57: %s: no connection\n", c[n].name);
+			return 1;
+		}
+
+		feed(cx, &tp, c[n].req, strlen(c[n].req));
+
+		/*
+		 * one answer, the refusal; nothing from the body or the
+		 * request behind it, whose answer would carry "/y\nb=2"; and
+		 * the connection is done with
+		 */
+		if (count_answers(&tp) != 1 || tp.tx_len < 13 ||
+		    memcmp(tp.tx, c[n].status, 13) ||
+		    find_bytes(tp.tx, tp.tx_len, "/y\nb=2") ||
+		    find_bytes(tp.tx, tp.tx_len, "/x\n") ||
+		    (!tp.shutdown && !tp.closed)) {
+			lwsl_err("case 57: %s: not refused whole: %d "
+				 "answers, %d bytes\n", c[n].name,
+				 (int)count_answers(&tp), (int)tp.tx_len);
+			lwsl_hexdump_err(tp.tx, tp.tx_len);
+			return 1;
+		}
+		if (tr_end())
+			return 1;
+	}
+
+	lwsl_user("case 57: a request framed two ways is refused whole, and "
+		  "nothing behind it is served: PASS\n");
+
+	return 0;
+}
+
+/*
+ * 58: the framings that are unambiguous keep their results, byte exactly: a
+ * Content-Length body, a chunked body, and a chunked body whose last-chunk
+ * carries a trailer field.  Each request comes in one read with a request
+ * pipelined behind its body, and both are answered in order on the
+ * kept-alive connection, so neither the body is read as the next request
+ * nor the next request as the body.
+ */
+static int
+h1_framing_kept_half(struct lws_context *cx, struct lws_vhost *vh)
+{
+	static const struct {
+		const char	*name;
+		const char	*req;
+		const char	*first;	/* the first answer's body */
+		const char	*second;	/* the pipelined answer's body */
+	} c[] = {
+		{ "h1-framing-kept-cl",
+		  "POST /x HTTP/1.1\r\nHost: sansio-uri\r\n"
+		  "Content-Length: 5\r\n\r\nabcde"
+		  "GET /y?b=2 HTTP/1.1\r\nHost: sansio-uri\r\n\r\n",
+		  "/x\n", "/y\nb=2" },
+		{ "h1-framing-kept-chunked",
+		  "POST /x?a=1 HTTP/1.1\r\nHost: sansio-uri\r\n"
+		  "Transfer-Encoding: chunked\r\n\r\n"
+		  "5\r\nabcde\r\n0\r\n\r\n"
+		  "GET /y?b=3 HTTP/1.1\r\nHost: sansio-uri\r\n\r\n",
+		  "/x\na=1", "/y\nb=3" },
+		{ "h1-framing-kept-trailer",
+		  "POST /x?a=2 HTTP/1.1\r\nHost: sansio-uri\r\n"
+		  "Transfer-Encoding: chunked\r\n\r\n"
+		  "5\r\nabcde\r\n0\r\nX-T: v\r\n\r\n"
+		  "GET /y?b=4 HTTP/1.1\r\nHost: sansio-uri\r\n\r\n",
+		  "/x\na=2", "/y\nb=4" },
+	};
+	static struct transport tp;
+	const uint8_t *b, *end;
+	size_t n;
+
+	for (n = 0; n < LWS_ARRAY_SIZE(c); n++) {
+		if (!server_conn(vh, &tp, c[n].name)) {
+			lwsl_err("case 58: %s: no connection\n", c[n].name);
+			return 1;
+		}
+
+		feed(cx, &tp, c[n].req, strlen(c[n].req));
+
+		/*
+		 * two answers, in order, each body right after its own head,
+		 * and then the kept-alive connection waiting for the next
+		 * request
+		 */
+		end = tp.tx + tp.tx_len;
+		b = find_bytes(tp.tx, tp.tx_len, "\r\n\r\n");
+		if (count_answers(&tp) != 2 || !b || tp.tx_len < 13 ||
+		    memcmp(tp.tx, "HTTP/1.1 200 ", 13)) {
+			lwsl_err("case 58: %s: no two answers\n", c[n].name);
+			lwsl_hexdump_err(tp.tx, tp.tx_len);
+			return 1;
+		}
+		b += 4;
+		if ((size_t)(end - b) < strlen(c[n].first) ||
+		    memcmp(b, c[n].first, strlen(c[n].first))) {
+			lwsl_err("case 58: %s: first body wrong\n", c[n].name);
+			lwsl_hexdump_err(tp.tx, tp.tx_len);
+			return 1;
+		}
+		b += strlen(c[n].first);
+		b = find_bytes(b, (size_t)(end - b), "\r\n\r\n");
+		if (!b) {
+			lwsl_err("case 58: %s: no second answer\n", c[n].name);
+			lwsl_hexdump_err(tp.tx, tp.tx_len);
+			return 1;
+		}
+		b += 4;
+		if ((size_t)(end - b) != strlen(c[n].second) ||
+		    memcmp(b, c[n].second, strlen(c[n].second))) {
+			lwsl_err("case 58: %s: second body wrong\n", c[n].name);
+			lwsl_hexdump_err(tp.tx, tp.tx_len);
+			return 1;
+		}
+		if (tp.closed || tp.shutdown) {
+			lwsl_err("case 58: %s: the connection ended\n",
+				 c[n].name);
+			return 1;
+		}
+		if (tr_end())
+			return 1;
+	}
+
+	lwsl_user("case 58: Content-Length, chunked and chunked with a trailer "
+		  "are framed as before, body and next request apart: PASS\n");
+
+	return 0;
+}
+
+/*
+ * 59: the bytes after an upgrade's head are the new protocol's, even when
+ * they come in the same read as the head, as a browser's first frame is
+ * coalesced with its upgrade request.  A masked frame there is echoed.
+ *
+ * But that same place must never be taken for another http request: what
+ * arrives after a 101 is the ws parser's, and a request written there
+ * cannot be a masked frame, so the connection fails it as a ws protocol
+ * error (a close with 1002) rather than serving it as a request.
+ */
+static int
+ws_upgrade_residual_half(struct lws_context *cx, struct lws_vhost *vh)
+{
+	static const char req_ws[] =
+		"GET /echo HTTP/1.1\r\nHost: sansio\r\nUpgrade: websocket\r\n"
+		"Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n"
+		"Sec-WebSocket-Protocol: echo\r\n"
+		"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+			  req_get[] =
+		"GET /y HTTP/1.1\r\nHost: sansio\r\n\r\n";
+	/* masked, zero key: TEXT "Hello" */
+	static const char hello[] = "\x81\x85\x00\x00\x00\x00Hello";
+	static struct transport tp;
+	uint8_t rd[512];
+	const uint8_t *b;
+	size_t rl, pos;
+
+	/* 1: the head and the first frame in one read */
+	rl = sizeof(req_ws) - 1;
+	memcpy(rd, req_ws, rl);
+	memcpy(rd + rl, hello, sizeof(hello) - 1);
+	echo_msgs = 0;
+	if (!server_conn(vh, &tp, "ws-server-upgrade-coalesced")) {
+		lwsl_err("case 59: no connection\n");
+		return 1;
+	}
+	feed(cx, &tp, rd, rl + sizeof(hello) - 1);
+	b = find_bytes(tp.tx, tp.tx_len, "\r\n\r\n");
+	pos = b ? (size_t)(b + 4 - tp.tx) : 0;
+	if (!b || tp.tx_len < 13 || memcmp(tp.tx, "HTTP/1.1 101 ", 13) ||
+	    !ws_frame_at(&tp, &pos, 0x1, 0, "Hello", 5) ||
+	    pos != tp.tx_len || echo_msgs != 1 ||
+	    tp.shutdown || tp.closed) {
+		lwsl_err("case 59: coalesced frame not echoed\n");
+		lwsl_hexdump_err(tp.tx, tp.tx_len);
+		return 1;
+	}
+	if (tr_end())
+		return 1;
+
+	/* 2: the head and an http request in one read: not a request */
+	rl = sizeof(req_ws) - 1;
+	memcpy(rd, req_ws, rl);
+	memcpy(rd + rl, req_get, sizeof(req_get) - 1);
+	echo_msgs = 0;
+	if (!server_conn(vh, &tp, "ws-server-upgrade-residual-not-request")) {
+		lwsl_err("case 59: no connection\n");
+		return 1;
+	}
+	feed(cx, &tp, rd, rl + sizeof(req_get) - 1);
+	b = find_bytes(tp.tx, tp.tx_len, "\r\n\r\n");
+	pos = b ? (size_t)(b + 4 - tp.tx) : 0;
+	/*
+	 * the 101, then one close with status 1002 and a reason, and nothing
+	 * else: no answer to the request, and the protocol was given nothing.
+	 * A server's frame is unmasked (RFC 6455 5.1)
+	 */
+	if (!b || tp.tx_len < 13 || memcmp(tp.tx, "HTTP/1.1 101 ", 13) ||
+	    count_answers(&tp) != 1 || echo_msgs ||
+	    tp.tx_len < pos + 8 || tp.tx[pos] != 0x88 ||
+	    (tp.tx[pos + 1] & 0x80) || (tp.tx[pos + 1] & 0x7f) < 3 ||
+	    (size_t)(tp.tx[pos + 1] & 0x7f) + 2 != tp.tx_len - pos ||
+	    tp.tx[pos + 2] != 0x03 || tp.tx[pos + 3] != 0xea ||
+	    (!tp.shutdown && !tp.closed)) {
+		lwsl_err("case 59: what followed the 101 was not ws's\n");
+		lwsl_hexdump_err(tp.tx, tp.tx_len);
+		return 1;
+	}
+
+	lwsl_user("case 59: what comes with an upgrade's head is the ws "
+		  "protocol's, and never another request: PASS\n");
+
+	return tr_end();
+}
+
+/*
+ * 60: an upgrade that is refused must not hand what came with it to the ws
+ * role.  No 101 verified anything, so the bytes after the head are not
+ * frames, whatever they look like, and the ws protocol must never be given
+ * them.  Each is one read: a refused head, then a masked frame where the
+ * body or the first frame would be.
+ */
+static int
+ws_upgrade_refused_data_half(struct lws_context *cx, struct lws_vhost *vh)
+{
+#define WS_UPG(extra) \
+	"GET /echo HTTP/1.1\r\nHost: sansio\r\nUpgrade: websocket\r\n" \
+	"Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n" \
+	"Sec-WebSocket-Protocol: echo\r\n" extra \
+	"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+	/* masked, zero key: TEXT "Hello", the first frame a peer may send */
+	static const char hello[] = "\x81\x85\x00\x00\x00\x00Hello";
+	static const struct {
+		const char	*name;
+		const char	*head;	/* the request head, no frame after */
+		const char	*status;
+	} c[] = {
+		/*
+		 * a body of its own: the frame is what the head's
+		 * Content-Length promised, and a request with a body is not
+		 * upgraded, since its body would become the new protocol's
+		 */
+		{ "ws-server-refused-upgrade-data-cl",
+		  WS_UPG("Content-Length: 11\r\n"), "HTTP/1.1 400 " },
+		/* a version lws does not speak: 426, saying the one it does */
+		{ "ws-server-refused-upgrade-data-version",
+		  "GET /echo HTTP/1.1\r\nHost: sansio\r\n"
+		  "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+		  "Sec-WebSocket-Version: 8\r\n"
+		  "Sec-WebSocket-Protocol: echo\r\n"
+		  "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+		  "HTTP/1.1 426 " },
+		/* a handshake with no key is not one (RFC 6455 4.2.1) */
+		{ "ws-server-refused-upgrade-data-nokey",
+		  "GET /echo HTTP/1.1\r\nHost: sansio\r\n"
+		  "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+		  "Sec-WebSocket-Version: 13\r\n"
+		  "Sec-WebSocket-Protocol: echo\r\n\r\n",
+		  "HTTP/1.1 400 " },
+	};
+#undef WS_UPG
+	static struct transport tp;
+	uint8_t rd[512];
+	size_t n, hl;
+
+	for (n = 0; n < LWS_ARRAY_SIZE(c); n++) {
+		hl = strlen(c[n].head);
+		/* the frame would be here, after the head, in one read */
+		memcpy(rd, c[n].head, hl);
+		memcpy(rd + hl, hello, sizeof(hello) - 1);
+		hl += sizeof(hello) - 1;
+
+		echo_msgs = 0;
+		if (!server_conn(vh, &tp, c[n].name)) {
+			lwsl_err("case 60: %s: no connection\n", c[n].name);
+			return 1;
+		}
+		feed(cx, &tp, rd, hl);
+
+		/*
+		 * one answer, the refusal; the ws protocol given nothing;
+		 * and no 101, so there is no ws connection at all
+		 */
+		if (count_answers(&tp) != 1 || tp.tx_len < 13 ||
+		    memcmp(tp.tx, c[n].status, 13) || echo_msgs ||
+		    find_bytes(tp.tx, tp.tx_len, "HTTP/1.1 101 ") ||
+		    (!tp.shutdown && !tp.closed)) {
+			lwsl_err("case 60: %s: refusal took the frame: %d "
+				 "answers, %d echo msgs, %d bytes\n",
+				 c[n].name, (int)count_answers(&tp), echo_msgs,
+				 (int)tp.tx_len);
+			lwsl_hexdump_err(tp.tx, tp.tx_len);
+			return 1;
+		}
+		if (tr_end())
+			return 1;
+	}
+
+	lwsl_user("case 60: a refused upgrade hands nothing to ws: PASS\n");
+
+	return 0;
+}
+
+/*
+ * 61: a request head that never ends is never a request.  Until its
+ * deadline the connection answers nothing; at the deadline it goes, so the
+ * bytes that would have completed it are never acted on, and never become
+ * another request than the one they started.
+ *
+ * It moves the time on past the header table's hold, so it goes last, at a
+ * time of its own, and it has no transcript: the timeouts of connections the
+ * cases before it left would come due with it.
+ */
+static int
+h1_truncated_head_half(struct lws_context *cx, struct lws_vhost *vh,
+		       int start_ms)
+{
+	static const char half[] =
+		"GET /x HTTP/1.1\r\nHost: sansio-uri\r\nContent-Len";
+	static struct transport tp;
+
+	if (!server_conn(vh, &tp, NULL)) {
+		lwsl_err("case 61: no connection\n");
+		return 1;
+	}
+
+	/* the head has no end: nothing is answered, and it is not closed */
+	feed(cx, &tp, half, sizeof(half) - 1);
+	if (tp.tx_len || tp.closed || tp.shutdown) {
+		lwsl_err("case 61: a head with no end was acted on\n");
+		lwsl_hexdump_err(tp.tx, tp.tx_len);
+		return 1;
+	}
+
+	/*
+	 * The header table's hold, the head's deadline, passes: the request
+	 * never completed, so it is not served, and the connection goes
+	 */
+	at(cx, start_ms + 11000);
+	if (!tp.closed) {
+		lwsl_err("case 61: the half head's deadline did not end it\n");
+		return 1;
+	}
+	if (tp.tx_len) {
+		lwsl_err("case 61: a head with no end was answered\n");
+		lwsl_hexdump_err(tp.tx, tp.tx_len);
+		return 1;
+	}
+
+	lwsl_user("case 61: a head that never ends is never a request, and "
+		  "the connection goes at its deadline: PASS\n");
 
 	return 0;
 }
@@ -6350,6 +6846,26 @@ main(int argc, const char **argv)
 	if (h1_completions_half(cx, vh_uri))
 		goto bail;
 
+	/*
+	 * Framing that a peer, or something in front of it, could have read
+	 * two ways is refused whole; the unambiguous framings keep their
+	 * results; and what comes with an upgrade's head is only ever the
+	 * new protocol's, never another request, and never the ws role's
+	 * unless a 101 was actually completed.
+	 */
+	at(cx, 353500);
+	if (h1_smuggle_framing_half(cx, vh_uri))
+		goto bail;
+	at(cx, 353600);
+	if (h1_framing_kept_half(cx, vh_uri))
+		goto bail;
+	at(cx, 353700);
+	if (ws_upgrade_residual_half(cx, vh))
+		goto bail;
+	at(cx, 353800);
+	if (ws_upgrade_refused_data_half(cx, vh))
+		goto bail;
+
 	/* a vhost taking a CONNECT to sansio-raw:443 raw, to raw-echo */
 	info.vhost_name = "sansio-raw";
 	info.protocols = protocols_raw;
@@ -6457,6 +6973,11 @@ main(int argc, const char **argv)
 #else
 	lwsl_user("case 55: no basic auth in this build, skipped\n");
 #endif
+
+	/* it moves the time on past the header table's hold, so it is last */
+	at(cx, 700000);
+	if (h1_truncated_head_half(cx, vh_uri, 700000))
+		goto bail;
 
 	result = 0;
 
